@@ -5,6 +5,16 @@ if enable_respawn == nil then
 	enable_respawn = true
 end
 
+-- Physics override management mods (shadow the global variable)
+local player_monoids = core.get_modpath("player_monoids") and player_monoids
+local pova           = core.get_modpath("pova")           and pova
+
+if player_monoids and not player_monoids.speed.checkout_branch then
+	-- This function exists since 2025-05-17
+	core.log("warning", "[beds] player_monoids is too old, thus not supported.")
+	player_monoids = nil
+end
+
 -- support for MT game translation.
 local S = beds.get_translator
 
@@ -50,6 +60,51 @@ local function check_in_beds(players)
 	return #players > 0
 end
 
+local function set_physics_override(player, put_to_bed)
+	local IDENTIFIER = "beds:lie"
+	local OVERRIDES = {speed = 0, jump = 0, gravity = 0}
+
+	local name = player:get_player_name()
+	local pdata = beds.player[name]
+
+	if put_to_bed then -- Freeze player
+		if player_monoids then
+			for k, v in pairs(OVERRIDES) do
+				local monoid = player_monoids[k]
+				pdata["monoid_branch_" .. k] = monoid:get_active_branch(player):get_name()
+				-- Change the "context" of the physics overrides
+				local branch = monoid:checkout_branch(player, IDENTIFIER)
+				branch:add_change(player, v)
+			end
+		elseif pova then
+			pova.add_override(name, "force", OVERRIDES)
+			pova.do_override(player)
+		else
+			-- Directly use engine API. May conflict with other mods.
+			pdata.physics_override = player:get_physics_override()
+			player:set_physics_override(OVERRIDES)
+		end
+	else -- Unfreeze player
+		if player_monoids then
+			for k, _ in pairs(OVERRIDES) do
+				local monoid = player_monoids[k]
+				monoid:checkout_branch(player, pdata["monoid_branch_" .. k])
+				monoid:get_branch(IDENTIFIER):delete(player)
+			end
+		elseif pova then
+			pova.del_override(name, "force")
+			pova.do_override(player)
+		else
+			-- Restore the changed fields
+			player:set_physics_override({
+				speed   = pdata.physics_override.speed,
+				jump    = pdata.physics_override.jump,
+				gravity = pdata.physics_override.gravity
+			})
+		end
+	end
+end
+
 local function lay_down(player, pos, bed_pos, state, skip)
 	local name = player:get_player_name()
 	local hud_flags = player:hud_get_flags()
@@ -72,13 +127,8 @@ local function lay_down(player, pos, bed_pos, state, skip)
 		player:set_pos(beds.pos[name])
 
 		-- physics, eye_offset, etc
-		local physics_override = beds.player[name].physics_override
+		set_physics_override(player, false)
 		beds.player[name] = nil
-		player:set_physics_override({
-			speed = physics_override.speed,
-			jump = physics_override.jump,
-			gravity = physics_override.gravity
-		})
 		player:set_eye_offset({x = 0, y = 0, z = 0}, {x = 0, y = 0, z = 0})
 		player:set_look_horizontal(math.random(1, 180) / 100)
 		player_api.player_attached[name] = false
@@ -97,7 +147,7 @@ local function lay_down(player, pos, bed_pos, state, skip)
 		end
 
 		-- Check if player is moving
-		if vector.length(player:get_velocity()) > 0.001 then
+		if vector.length(player:get_velocity()) > 0.05 then
 			minetest.chat_send_player(name, S("You have to stop moving before going to bed!"))
 			return false
 		end
@@ -112,9 +162,9 @@ local function lay_down(player, pos, bed_pos, state, skip)
 			return false
 		end
 
+		beds.player[name] = {}
 		beds.pos[name] = pos
 		beds.bed_position[name] = bed_pos
-		beds.player[name] = {physics_override = player:get_physics_override()}
 
 		local yaw, param2 = get_look_yaw(bed_pos)
 		player:set_look_horizontal(yaw)
@@ -126,7 +176,7 @@ local function lay_down(player, pos, bed_pos, state, skip)
 			y = bed_pos.y + 0.07,
 			z = bed_pos.z + dir.z / 2
 		}
-		player:set_physics_override({speed = 0, jump = 0, gravity = 0})
+		set_physics_override(player, true)
 		player:set_pos(p)
 		player_api.player_attached[name] = true
 		hud_flags.wielditem = false
@@ -181,6 +231,44 @@ function beds.skip_night()
 	minetest.set_timeofday(0.23)
 end
 
+local update_scheduled = false
+local function schedule_update()
+	if update_scheduled then
+		-- there already is an update scheduled; don't schedule more to prevent races
+		return
+	end
+	update_scheduled = true
+	minetest.after(2, function()
+		update_scheduled = false
+		if not is_sp then
+			update_formspecs(is_night_skip_enabled())
+		end
+		if is_night_skip_enabled() then
+			-- skip the night and let all players stand up
+			beds.skip_night()
+			beds.kick_players()
+		end
+	end)
+end
+
+function beds.kick_player_at(kick_pos)
+	for name, bed_pos in pairs(beds.bed_position) do
+		if vector.equals(bed_pos, kick_pos) then
+			if beds.player[name] then
+				local player = core.get_player_by_name(name)
+				if not player then
+					return false
+				end
+				lay_down(player, nil, nil, false)
+				core.close_formspec(name, "beds_form")
+				core.log("info", "[beds] Kicked "..name.." out of bed at "..core.pos_to_string(kick_pos))
+				return true
+			end
+		end
+	end
+	return false
+end
+
 function beds.on_rightclick(pos, player)
 	local name = player:get_player_name()
 	local ppos = player:get_pos()
@@ -190,14 +278,20 @@ function beds.on_rightclick(pos, player)
 		if beds.player[name] then
 			lay_down(player, nil, nil, false)
 		end
-		minetest.chat_send_player(name, S("You can only sleep at night."))
+		local current_spawn = beds.spawn[name]
+		if not current_spawn or vector.distance(current_spawn, pos) > 0.1 then
+			beds.set_spawns(player, pos)
+			core.chat_send_player(name, S("Spawn point set."))
+		else
+			core.chat_send_player(name, S("You can only sleep at night."))
+		end
 		return
 	end
 
 	-- move to bed
 	if not beds.player[name] then
 		lay_down(player, ppos, pos)
-		beds.set_spawns() -- save respawn positions when entering bed
+		beds.set_spawns(player, pos) -- save respawn positions when entering bed
 	else
 		lay_down(player, nil, nil, false)
 	end
@@ -206,17 +300,8 @@ function beds.on_rightclick(pos, player)
 		update_formspecs(false)
 	end
 
-	-- skip the night and let all players stand up
 	if check_in_beds() then
-		minetest.after(2, function()
-			if not is_sp then
-				update_formspecs(is_night_skip_enabled())
-			end
-			if is_night_skip_enabled() then
-				beds.skip_night()
-				beds.kick_players()
-			end
-		end)
+		schedule_update()
 	end
 end
 
@@ -233,10 +318,9 @@ end
 -- Callbacks
 -- Only register respawn callback if respawn enabled
 if enable_respawn then
-	-- respawn player at bed if enabled and valid position is found
-	minetest.register_on_respawnplayer(function(player)
-		local name = player:get_player_name()
-		local pos = beds.spawn[name]
+	-- Respawn player at bed if valid position is found
+	spawn.register_on_spawn(function(player, is_new)
+		local pos = beds.spawn[player:get_player_name()]
 		if pos then
 			player:set_pos(pos)
 			return true
@@ -249,13 +333,7 @@ minetest.register_on_leaveplayer(function(player)
 	lay_down(player, nil, nil, false, true)
 	beds.player[name] = nil
 	if check_in_beds() then
-		minetest.after(2, function()
-			update_formspecs(is_night_skip_enabled())
-			if is_night_skip_enabled() then
-				beds.skip_night()
-				beds.kick_players()
-			end
-		end)
+		schedule_update()
 	end
 end)
 
